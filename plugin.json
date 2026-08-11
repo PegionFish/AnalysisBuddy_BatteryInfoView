@@ -1,0 +1,14 @@
+{
+  "id": "batteryinfoview",
+  "display_name": "BatteryInfoView 电池日志解析器",
+  "version": "0.1.0",
+  "entry": {
+    "command": "python",
+    "args": ["main.py"]
+  },
+  "match": {
+    "extensions": ["txt"],
+    "header_fingerprints": ["AC Power", "DC Power"]
+  },
+  "min_protocol_version": 1
+}
