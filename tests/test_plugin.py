@@ -211,6 +211,17 @@ class TestParse:
         assert "raw_line" not in records[4]
         assert "raw_line" not in records[-1]
 
+    def test_raw_line_crlf_stripped(self, plugin, tmp_path, emitted):
+        path = tmp_path / "crlf.txt"
+        path.write_text(LINE_MDY_1.replace("\n", "\r\n") + LINE_MDY_2, encoding="utf-8")
+        _load(plugin, str(path))
+        plugin.on_parse("f1", None, emitted[1])
+        _finish(emitted)
+        records = _records(emitted)
+        # 首组带 raw_line，CRLF 行不得残留尾部 \r
+        assert records[0]["raw_line"] == LINE_MDY_1.rstrip("\r\n")
+        assert "\r" not in records[0]["raw_line"]
+
     def test_bad_lines_skipped_in_parse(self, plugin, tmp_log, emitted):
         _load(plugin, tmp_log)
         total = plugin.on_parse("f1", None, emitted[1])
@@ -246,6 +257,41 @@ class TestParse:
     def test_parse_unknown_file_id_raises_keyerror(self, plugin, emitted):
         with pytest.raises(KeyError):
             plugin.on_parse("nope", None, emitted[1])
+
+
+class TestE2EFixtures:
+    @pytest.fixture
+    def fixtures_dir(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(root, "tests", "fixtures")
+
+    def test_sample_records_total(self, plugin, fixtures_dir, emitted):
+        path = os.path.join(fixtures_dir, "biv_sample.txt")
+        summary = _load(plugin, path)
+        assert summary["record_count_hint"] == 25
+        total = plugin.on_parse("f1", None, emitted[1])
+        _finish(emitted)
+        records = _records(emitted)
+        assert total == 25 * 4
+        assert len(records) == 25 * 4
+
+    def test_malformed_bad_lines(self, plugin, fixtures_dir):
+        path = os.path.join(fixtures_dir, "biv_malformed.txt")
+        summary = _load(plugin, path)
+        assert summary["record_count_hint"] == 5
+        assert "5 lines, 3 bad lines skipped" in summary["note"]
+
+    def test_dmy_fixture_fallback(self, plugin, fixtures_dir, emitted):
+        path = os.path.join(fixtures_dir, "biv_dmy.txt")
+        summary = _load(plugin, path)
+        # load 期不做行级回退（裁定 5）：3 行 m.d.y 直接成功，2 行 d.m.y-only + 1 行无 AM/PM 计入 bad
+        assert summary["record_count_hint"] == 3
+        assert "3 lines, 3 bad lines skipped" in summary["note"]
+        # on_parse 行级回退（§7 注）：d.m.y-only 2 行经 "d.m.y" 重试成功 → 5 行 × 4
+        total = plugin.on_parse("f1", None, emitted[1])
+        _finish(emitted)
+        assert total == 5 * 4
+        assert len(_records(emitted)) == 5 * 4
 
 
 class TestKeyValues:

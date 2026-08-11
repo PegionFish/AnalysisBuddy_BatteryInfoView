@@ -196,7 +196,7 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
                 ]
                 if total % 500 == 0:
                     for r in records:
-                        r["raw_line"] = raw.rstrip("\n")
+                        r["raw_line"] = raw.rstrip("\r\n")
                 ctx.emit_records(records)
                 total += 4
                 if line_no % 20000 == 0:
