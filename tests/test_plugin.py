@@ -87,34 +87,37 @@ class TestCanHandle:
         assert result["confidence"] == 0.9
 
     def test_txt_time_no_power_050(self, plugin):
+        # skip-if-empty：reason 无值时不输出键
         assert plugin.on_can_handle(
             {"ext": "txt", "head_sample": HEAD_NO_POWER}) == {
-            "can_handle": True, "confidence": 0.5, "reason": None}
+            "can_handle": True, "confidence": 0.5}
 
     def test_non_txt_abstains(self, plugin):
         assert plugin.on_can_handle(
             {"ext": "csv", "head_sample": HEAD_POWER}) == {
-            "can_handle": False, "confidence": 0.0, "reason": None}
+            "can_handle": False, "confidence": 0.0}
 
     def test_no_time_abstains(self, plugin):
         assert plugin.on_can_handle(
             {"ext": "txt", "head_sample": HEAD_NO_TIME}) == {
-            "can_handle": False, "confidence": 0.0, "reason": None}
+            "can_handle": False, "confidence": 0.0}
 
     def test_missing_head_sample_abstains(self, plugin):
         assert plugin.on_can_handle({"ext": "txt"}) == {
-            "can_handle": False, "confidence": 0.0, "reason": None}
+            "can_handle": False, "confidence": 0.0}
 
 
 class TestLoadFile:
     def test_summary_hint_time_range_note(self, plugin, tmp_log):
+        # P0：load 只做采样——hint 为样本估算（≤20 行小文件 == 行数）；
+        # time_range start=样本首行 ts、end=尾部采样末行 ts
         summary = _load(plugin, tmp_log)
-        assert summary["record_count_hint"] == 3
+        assert summary["record_count_hint"] == 4
         tr = summary["time_range"]
         assert tr["start_ms"] == parse_timestamp(TS_MDY_1, "m.d.y")
         assert tr["end_ms"] == parse_timestamp(TS_DC, "m.d.y")
         assert tr["start_ms"] <= tr["end_ms"]
-        assert summary["note"] == "batteryinfoview: 3 lines, 1 bad lines skipped"
+        assert summary["note"] == "batteryinfoview: ~4 records (head-sample estimate of 4 lines)"
 
     def test_missing_file_raises(self, plugin):
         with pytest.raises(FileLoadFailedError) as excinfo:
@@ -122,12 +125,14 @@ class TestLoadFile:
         assert "file not found" in str(excinfo.value)
         assert excinfo.value.data == {"path": os.path.join("nonexistent", "missing.txt")}
 
-    def test_too_few_success_lines_raises(self, plugin, tmp_path):
+    def test_single_good_line_loads(self, plugin, tmp_path):
+        # 样本判据（首行可解析 且 样本中可解析行 ≥1）取代旧的 line_count≥2 整文件统计：
+        # 单好行文件应能加载，hint 按行数估算
         path = tmp_path / "one.txt"
         path.write_text(LINE_MDY_1 + BAD_LINE, encoding="utf-8")
-        with pytest.raises(FileLoadFailedError) as excinfo:
-            _load(plugin, str(path))
-        assert "not a BatteryInfoView log" in str(excinfo.value)
+        summary = _load(plugin, str(path))
+        assert summary["record_count_hint"] == 2
+        assert summary["time_range"]["start_ms"] == parse_timestamp(TS_MDY_1, "m.d.y")
 
     def test_first_line_bad_raises(self, plugin, tmp_path):
         path = tmp_path / "junk_first.txt"
@@ -140,7 +145,7 @@ class TestLoadFile:
         path = tmp_path / "mdy.txt"
         path.write_text(LINE_MDY_1 + LINE_MDY_2 + BAD_COLS, encoding="utf-8")
         summary = _load(plugin, str(path))
-        assert summary["record_count_hint"] == 2
+        assert summary["record_count_hint"] == 3
 
     def test_auto_probe_first_line_dmy(self, plugin, tmp_path):
         path = tmp_path / "dmy.txt"
@@ -155,6 +160,45 @@ class TestLoadFile:
         path.write_text("", encoding="utf-8")
         with pytest.raises(FileLoadFailedError):
             _load(plugin, str(path))
+
+    def test_head_sample_estimate_not_full_scan(self, plugin, tmp_path):
+        # 30 行（>20 行样本窗口）：hint 按「前 20 行样本均长」估算，
+        # 尾部追加长坏行使估算值明显偏离真实行数 30，证明非整文件统计
+        short = LINE_MDY_1
+        long_bad = "zzz," * 90 + "\n"  # 361 字节坏行
+        path = tmp_path / "head30.txt"
+        path.write_text(short * 25 + long_bad * 5, encoding="utf-8")
+        summary = _load(plugin, str(path))
+        with open(str(path), encoding="utf-8") as f:
+            sample = [f.readline() for _ in range(20)]
+        avg = sum(len(l) for l in sample) / len(sample)
+        size = os.path.getsize(str(path))
+        assert summary["record_count_hint"] == int(size / avg)
+        assert summary["record_count_hint"] != 30  # 30 行文件 ≠ 精确行数
+
+    def test_tail_sample_last_ts(self, plugin, tmp_path):
+        # 80 行 > 4096 字节尾部窗口：end_ms 必须是末行 ts（来自尾部采样，非首部样本）
+        path = tmp_path / "tail80.txt"
+        lines = [LINE_MDY_1.replace("3:30:57", "3:%02d:%02d" % (30 + i // 60, i % 60))
+                 for i in range(79)]
+        last = LINE_MDY_2.replace("3:31:07", "4:00:00")
+        path.write_text("".join(lines) + last, encoding="utf-8")
+        summary = _load(plugin, str(path))
+        assert summary["time_range"]["start_ms"] == parse_timestamp("8/6/2026 3:30:00 PM", "m.d.y")
+        assert summary["time_range"]["end_ms"] == parse_timestamp("8/6/2026 4:00:00 PM", "m.d.y")
+        # 估算公式（盘上字节 / 样本行均长）；80 行统一长度 → 贴近 80
+        with open(str(path), encoding="utf-8") as f:
+            sample = [f.readline() for _ in range(20)]
+        avg = sum(len(l) for l in sample) / len(sample)
+        assert summary["record_count_hint"] == int(os.path.getsize(str(path)) / avg)
+
+    def test_tail_sample_all_bad_omits_time_range(self, plugin, tmp_path):
+        # 尾部窗口内末 5 行全坏 → last_ts None → 省略 time_range 键
+        path = tmp_path / "junk_tail.txt"
+        path.write_text(LINE_MDY_1 * 20 + ("zzz," * 90 + "\n") * 5, encoding="utf-8")
+        summary = _load(plugin, str(path))
+        assert "time_range" not in summary
+        assert summary["record_count_hint"] > 0
 
 
 class TestSchema:
@@ -268,6 +312,7 @@ class TestE2EFixtures:
     def test_sample_records_total(self, plugin, fixtures_dir, emitted):
         path = os.path.join(fixtures_dir, "biv_sample.txt")
         summary = _load(plugin, path)
+        # 25 行统一长度 → 估算恰为 25
         assert summary["record_count_hint"] == 25
         total = plugin.on_parse("f1", None, emitted[1])
         _finish(emitted)
@@ -278,15 +323,16 @@ class TestE2EFixtures:
     def test_malformed_bad_lines(self, plugin, fixtures_dir):
         path = os.path.join(fixtures_dir, "biv_malformed.txt")
         summary = _load(plugin, path)
-        assert summary["record_count_hint"] == 5
-        assert "5 lines, 3 bad lines skipped" in summary["note"]
+        # P0：load 不做整文件统计——hint 为估算（8 行文件 == 行数），坏行统计在 parse 期
+        assert summary["record_count_hint"] == 8
+        assert "estimate" in summary["note"]
 
     def test_dmy_fixture_fallback(self, plugin, fixtures_dir, emitted):
         path = os.path.join(fixtures_dir, "biv_dmy.txt")
         summary = _load(plugin, path)
-        # load 期不做行级回退（裁定 5）：3 行 m.d.y 直接成功，2 行 d.m.y-only + 1 行无 AM/PM 计入 bad
-        assert summary["record_count_hint"] == 3
-        assert "3 lines, 3 bad lines skipped" in summary["note"]
+        # load 期不做行级回退（裁定 5）：样本判据只看 resolved 格式（m.d.y 可解析行 ≥1）
+        assert summary["record_count_hint"] == 6
+        assert "estimate" in summary["note"]
         # on_parse 行级回退（§7 注）：d.m.y-only 2 行经 "d.m.y" 重试成功 → 5 行 × 4
         total = plugin.on_parse("f1", None, emitted[1])
         _finish(emitted)
@@ -295,15 +341,21 @@ class TestE2EFixtures:
 
 
 class TestKeyValues:
-    def test_latest_state_at_tail(self, plugin, tmp_log):
-        _load(plugin, tmp_log)
+    def _load_and_parse(self, plugin, path, emitted):
+        """load + parse 后 index 才可用（P0：BivIndex 构建推迟到 parse）。"""
+        _load(plugin, path)
+        plugin.on_parse("f1", None, emitted[1])
+        _finish(emitted)
+
+    def test_latest_state_at_tail(self, plugin, tmp_log, emitted):
+        self._load_and_parse(plugin, tmp_log, emitted)
         entries = plugin.on_key_values("f1", 10**18)["entries"]
         by_key = {e["key"]: e for e in entries}
         assert by_key == {"power_state": {"key": "power_state", "value": "DC Power"},
                           "log_type": {"key": "log_type", "value": "On Battery"}}
 
-    def test_state_at_midpoint(self, plugin, tmp_log):
-        _load(plugin, tmp_log)
+    def test_state_at_midpoint(self, plugin, tmp_log, emitted):
+        self._load_and_parse(plugin, tmp_log, emitted)
         t1 = parse_timestamp(TS_MDY_1, "m.d.y")
         t3 = parse_timestamp(TS_DC, "m.d.y")
         mid = (t1 + t3) // 2
@@ -312,15 +364,20 @@ class TestKeyValues:
         assert by_key["power_state"]["value"] == "AC Power"
         assert by_key["log_type"]["value"] == "Timer"
 
-    def test_before_first_line_is_empty(self, plugin, tmp_log):
-        _load(plugin, tmp_log)
+    def test_before_first_line_is_empty(self, plugin, tmp_log, emitted):
+        self._load_and_parse(plugin, tmp_log, emitted)
         assert plugin.on_key_values("f1", 0) == {"entries": []}
+
+    def test_before_parse_is_empty(self, plugin, tmp_log):
+        # P0：file 已 load 但尚未 parse（index 未构建）→ 无状态可查
+        _load(plugin, tmp_log)
+        assert plugin.on_key_values("f1", 10**18) == {"entries": []}
 
     def test_unloaded_file_id_is_empty(self, plugin):
         assert plugin.on_key_values("nope", 123) == {"entries": []}
 
-    def test_unload_file_clears_state(self, plugin, tmp_log):
-        _load(plugin, tmp_log)
+    def test_unload_file_clears_state(self, plugin, tmp_log, emitted):
+        self._load_and_parse(plugin, tmp_log, emitted)
         assert plugin.on_key_values("f1", 10**18)["entries"]
         plugin.on_unload_file("f1")
         assert plugin.on_key_values("f1", 10**18) == {"entries": []}
@@ -342,14 +399,49 @@ class TestManifest:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "plugin.json"), encoding="utf-8") as f:
             manifest = json.load(f)
-        assert manifest == {
-            "id": "batteryinfoview",
-            "display_name": "BatteryInfoView 电池日志解析器",
-            "version": "0.1.0",
-            "entry": {"command": "python", "args": ["main.py"]},
-            "match": {
-                "extensions": ["txt"],
-                "header_fingerprints": ["AC Power", "DC Power"],
-            },
-            "min_protocol_version": 1,
+        assert manifest["id"] == "batteryinfoview"
+        assert manifest["display_name"] == "BatteryInfoView 电池日志解析器"
+        assert manifest["version"] == "0.1.0"
+        assert manifest["entry"] == {"command": "python", "args": ["main.py"]}
+        assert manifest["match"] == {
+            "extensions": ["txt"],
+            "header_fingerprints": ["AC Power", "DC Power"],
         }
+        assert manifest["min_protocol_version"] == 1
+        assert manifest["author"] == "PegionFish"
+        assert manifest["repository"].startswith("https://")
+        assert manifest["update_url"] == manifest["repository"]
+        assert manifest["tools"] == ["AnalysisBuddy >= 0.1.0"]
+        changelog = manifest["changelog"]
+        assert changelog[0]["version"] == manifest["version"]
+        assert changelog[0]["date"] == "2026-08-15"
+        assert isinstance(changelog[0]["notes"], list) and changelog[0]["notes"]
+
+    def test_presets_structure_and_ids(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "plugin.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+        presets = manifest["presets"]
+        assert 1 <= len(presets) <= 32
+        for preset in presets:
+            assert preset["id"] == preset["id"].lower()
+            assert "name" in preset and "zh" in preset["name"] and "en" in preset["name"]
+            assert "description" in preset
+            assert all(isinstance(k, str) and k for k in preset.get("keywords", []))
+            for group in preset.get("groups", []):
+                assert group["id"] and group["name"]["zh"] and group["name"]["en"]
+                for entry in group["entries"]:
+                    assert entry["names"]
+            for entry in preset.get("entries", []):
+                assert entry["names"]
+        # 4 个静态指标双通道（metric_id + 中文名）穷举在预设中全覆盖
+        names = set()
+        for preset in presets:
+            for group in preset.get("groups", []):
+                for entry in group["entries"]:
+                    names.update(entry["names"])
+            for entry in preset.get("entries", []):
+                names.update(entry["names"])
+        for mid, cn in (("battery_level", "电池电量"), ("full_capacity", "满充容量"),
+                        ("current_capacity", "当前容量"), ("design_capacity", "设计容量")):
+            assert mid in names and cn in names

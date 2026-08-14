@@ -10,5 +10,51 @@
     "extensions": ["txt"],
     "header_fingerprints": ["AC Power", "DC Power"]
   },
-  "min_protocol_version": 1
+  "min_protocol_version": 1,
+  "author": "PegionFish",
+  "repository": "https://github.com/PegionFish/AnalysisBuddy_BatteryInfoView",
+  "update_url": "https://github.com/PegionFish/AnalysisBuddy_BatteryInfoView",
+  "changelog": [
+    {
+      "version": "0.1.0",
+      "date": "2026-08-15",
+      "notes": ["首个可用版本：BatteryInfoView TXT 日志解析、四项电池指标、key_values 状态查询"]
+    }
+  ],
+  "tools": ["AnalysisBuddy >= 0.1.0"],
+  "presets": [
+    {
+      "id": "battery-health",
+      "name": { "zh": "电池健康度", "en": "Battery Health" },
+      "description": { "zh": "电量与容量全量指标（满充/当前/设计容量）", "en": "All battery level and capacity metrics" },
+      "groups": [
+        {
+          "id": "capacity",
+          "name": { "zh": "容量", "en": "Capacity" },
+          "entries": [
+            { "want": "full_capacity", "names": ["full_capacity", "满充容量"] },
+            { "want": "current_capacity", "names": ["current_capacity", "当前容量"] },
+            { "want": "design_capacity", "names": ["design_capacity", "设计容量"] }
+          ]
+        },
+        {
+          "id": "level",
+          "name": { "zh": "电量", "en": "Level" },
+          "entries": [
+            { "want": "battery_level", "names": ["battery_level", "电池电量"] }
+          ]
+        }
+      ],
+      "keywords": ["battery", "capacity", "电量"]
+    },
+    {
+      "id": "battery-charge",
+      "name": { "zh": "电池电量", "en": "Battery Level" },
+      "description": { "zh": "仅电池电量百分比，简单场景", "en": "Battery level percentage only" },
+      "entries": [
+        { "want": "level", "names": ["battery_level", "电池电量"] }
+      ],
+      "keywords": ["battery", "level", "电量"]
+    }
+  ]
 }

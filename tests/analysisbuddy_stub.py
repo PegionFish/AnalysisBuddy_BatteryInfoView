@@ -63,6 +63,10 @@ class EmitContext:
 
 
 class AnalysisBuddyError(Exception):
+    # 对齐真实 SDK（errors.py）：code/message 类属性即 JSON-RPC 错误码
+    code: int = -32603
+    message: str = "Internal error"
+
     def __init__(self, message: str, data: typing.Any = None) -> None:
         super().__init__(message)
         self.message = message
@@ -83,6 +87,16 @@ class CancelledError(AnalysisBuddyError):
 
 class InvalidParamsError(AnalysisBuddyError):
     pass
+
+
+class UnsupportedInV1Error(AnalysisBuddyError):
+    """对齐真实 SDK（sdk/python/analysisbuddy/errors.py）：-32005 unsupported_in_v1。"""
+
+    code = -32005
+    message = "unsupported in v1"
+
+    def __init__(self, message: str = "unsupported in v1", data: typing.Any = None) -> None:
+        super().__init__(message, data)
 
 
 class AnalysisBuddyPlugin:
@@ -125,7 +139,10 @@ class AnalysisBuddyPlugin:
         return {}
 
     def on_parse(self, file_id: str, options: typing.Optional[dict], ctx: EmitContext) -> int:
-        return 0
+        # 对齐真实 SDK（plugin.py on_parse 默认实现）：parse 是必选方法，
+        # 未覆写即抛 UnsupportedInV1Error → -32005 unsupported_in_v1
+        raise UnsupportedInV1Error(
+            "parse not implemented by this plugin", data={"file_id": file_id})
 
     def on_schema(self) -> dict:
         return {"metrics": []}
@@ -134,7 +151,8 @@ class AnalysisBuddyPlugin:
         return {"entries": []}
 
     def on_annotate(self, file_id: str, range: dict) -> dict:
-        return {"events": []}
+        # 对齐真实 SDK（plugin.py on_annotate 默认实现）：annotate 未实现即抛
+        raise UnsupportedInV1Error("annotate is not supported by this plugin")
 
     def on_unload_file(self, file_id: str) -> None:
         return None
@@ -153,6 +171,7 @@ def _install_stub() -> None:
     module.ParseFailedError = ParseFailedError
     module.CancelledError = CancelledError
     module.InvalidParamsError = InvalidParamsError
+    module.UnsupportedInV1Error = UnsupportedInV1Error
     sys.modules["analysisbuddy"] = module
 
 

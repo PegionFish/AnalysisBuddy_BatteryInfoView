@@ -14,11 +14,16 @@
 # 时间戳直读 UTC 毫秒不换算；time_format auto 在 load 期用首行探测一次并记住
 # time_format_resolved；行级回退：tfmt=="m.d.y" 且 parse_line 失败时再试 "d.m.y"
 # 一次（deep-dive §7 注，回退在 main.py 实现，parser 不做回退）。
+#
+# load 超时预算（协议 load_file 仅 10s，P0）：on_load_file 只做 O(表头+样本) 工作——
+# 读前 20 行头部样本做格式判据与 first_ts，seek 文件尾部 4096 字节窗口取末 5 行
+# 做 last_ts，record_count_hint 按样本行均长估算（非精确）；BivIndex 构建与
+# bad_lines 统计全部推迟到 on_parse（parse 有 15min 预算与进度上报）。
 
 import json
 import os
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from analysisbuddy import AnalysisBuddyPlugin, FileLoadFailedError
 
@@ -26,6 +31,39 @@ from parser import BivIndex, parse_line
 
 _CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 _DEFAULT_CONFIG = {"time_format": "auto", "encoding": "auto"}
+
+# load 期采样窗口（O(表头+样本)，见模块头注释）
+_HEAD_SAMPLE_LINES = 20   # 头部样本行数上限
+_TAIL_SAMPLE_BYTES = 4096  # 尾部采样窗口字节数
+_TAIL_SAMPLE_LINES = 5     # 尾部样本取末 N 行
+
+
+def _read_head_sample(path: str, encoding: str, limit: int = _HEAD_SAMPLE_LINES) -> List[str]:
+    """读文件头部最多 limit 行样本（O(表头)），不触全文件扫描。"""
+    lines: List[str] = []
+    with open(path, "r", encoding=encoding, errors="replace") as f:
+        for _ in range(limit):
+            line = f.readline()
+            if line == "":
+                break
+            lines.append(line)
+    return lines
+
+
+def _read_tail_sample(path: str, encoding: str, max_bytes: int = _TAIL_SAMPLE_BYTES,
+                      limit: int = _TAIL_SAMPLE_LINES) -> List[str]:
+    """seek 到文件尾部 max_bytes 窗口读原始字节，按行拆分取末 limit 行（O(尾部窗口)）。
+
+    窗口起点可能落在行中间，首片段是残缺行——只取末 limit 行，残缺行自然被丢弃；
+    窗口起点 clamp 到 0（小文件读全量）。"""
+    size = os.path.getsize(path)
+    if size == 0:
+        return []
+    start = max(0, size - max_bytes)
+    with open(path, "rb") as f:
+        f.seek(start)
+        raw = f.read()
+    return raw.decode(encoding, errors="replace").splitlines()[-limit:]
 
 
 def _decode_name(cfg: dict) -> str:
@@ -63,7 +101,7 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
 
     def __init__(self) -> None:
         super().__init__()
-        # file_id -> {"path","index","config","line_count","bad_lines","first_ts","last_ts"}
+        # file_id -> {"path","config","index","bad_lines"}; index/bad_lines 由 on_parse 填充
         self._files: Dict[str, Dict] = {}
 
     # ---- 生命周期 ------------------------------------------------------
@@ -98,17 +136,21 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
         return None
 
     def on_can_handle(self, p: dict) -> dict:
+        # skip-if-empty 约定：reason 无值时省略键，不输出 null
         ext = p.get("ext", "")
         head = p.get("head_sample") or ""
         has_time = bool(re.search(r"\d{1,2}/\d{1,2}/\d{4} \d{1,2}:\d{2}:\d{2} (AM|PM)", head, re.I))
         has_power = ("ac power" in head.lower()) or ("dc power" in head.lower())
         if ext != "txt" or not has_time:
-            return {"can_handle": False, "confidence": 0.0, "reason": None}
-        confidence = 0.9 if has_power else 0.5
-        return {"can_handle": True, "confidence": confidence,
-                "reason": "BatteryInfoView log format detected" if has_power else None}
+            return {"can_handle": False, "confidence": 0.0}
+        if has_power:
+            return {"can_handle": True, "confidence": 0.9,
+                    "reason": "BatteryInfoView log format detected"}
+        return {"can_handle": True, "confidence": 0.5}
 
     def on_load_file(self, p: dict) -> dict:
+        # P0：load 只做 O(表头+样本) 工作（协议 load_file 仅 10s 预算），
+        # BivIndex 构建与 bad_lines 统计推迟到 on_parse（15min 预算）。
         path = p["path"]
         if not os.path.exists(path):
             raise FileLoadFailedError(f"file not found: {path}", data={"path": path})
@@ -117,47 +159,50 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
         config["path"] = path  # 供 _decode_name 的 auto 探测
         encoding = _decode_name(config)
 
-        with open(path, "r", encoding=encoding, errors="replace") as f:
-            first_line = f.readline()
+        sample = _read_head_sample(path, encoding)
+        if not sample:
+            raise FileLoadFailedError("not a BatteryInfoView log", data={"path": path})
 
-        resolved = self._probe_time_format(config, first_line)
+        # 首行 time_format 探测（既有判据：首行非法即拒）
+        resolved = self._probe_time_format(config, sample[0])
         if resolved is None:
             raise FileLoadFailedError("not a BatteryInfoView log", data={"path": path})
         config["time_format_resolved"] = resolved
 
-        index = BivIndex()
-        line_count = 0
-        bad_lines = 0
-        first_ts: Optional[int] = None
-        last_ts: Optional[int] = None
-        with open(path, "r", encoding=encoding, errors="replace") as f:
-            for raw in f:
-                parsed = parse_line(raw, resolved)
-                if parsed is None:
-                    bad_lines += 1
-                    continue
-                index.add(parsed)
-                line_count += 1
-                if first_ts is None:
-                    first_ts = parsed.timestamp
-                last_ts = parsed.timestamp
-
-        if line_count < 2 or parse_line(first_line, resolved) is None:
+        # 样本判据（替代整文件扫描）：样本中可解析行 ≥1
+        # （load 期不做行级回退，裁定 5；首行可解析已由探测保证）
+        parsed_sample = [parse_line(line, resolved) for line in sample]
+        if not any(parsed is not None for parsed in parsed_sample):
             raise FileLoadFailedError("not a BatteryInfoView log", data={"path": path})
+
+        first_ts = next(parsed.timestamp for parsed in parsed_sample
+                        if parsed is not None)
+
+        # 尾部采样：末 5 行解析出 last_ts；样本全坏 → None（省略 time_range）
+        last_ts: Optional[int] = None
+        for raw in reversed(_read_tail_sample(path, encoding)):
+            parsed = parse_line(raw, resolved)
+            if parsed is not None:
+                last_ts = parsed.timestamp
+                break
+
+        # record_count_hint：按样本行均长估算（int(文件字节 / 行均字节数)），
+        # 只用于 UI 提示，非精确统计（精确值由 parse 返回）
+        file_bytes = os.path.getsize(path)
+        avg_bytes = sum(len(line) for line in sample) / len(sample)
+        hint = int(file_bytes / avg_bytes) if avg_bytes > 0 else 0
 
         self._files[p["file_id"]] = {
             "path": path,
-            "index": index,
             "config": config,
-            "line_count": line_count,
-            "bad_lines": bad_lines,
-            "first_ts": first_ts,
-            "last_ts": last_ts,
+            "index": None,      # 延迟到 on_parse 构建（P0）
+            "bad_lines": 0,     # 延迟到 on_parse 统计（P0）
         }
-        summary = {"record_count_hint": line_count}
-        if first_ts is not None:
+        summary = {"record_count_hint": hint}
+        if last_ts is not None:
             summary["time_range"] = {"start_ms": first_ts, "end_ms": last_ts}
-        summary["note"] = f"batteryinfoview: {line_count} lines, {bad_lines} bad lines skipped"
+        summary["note"] = (f"batteryinfoview: ~{hint} records "
+                           f"(head-sample estimate of {len(sample)} lines)")
         return summary
 
     def on_schema(self) -> dict:
@@ -172,6 +217,8 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
         data = self._files[file_id]
         path = data["path"]
         tfmt = data["config"]["time_format_resolved"]
+        index = BivIndex()
+        bad_lines = 0
         total = 0
         line_no = 0
         file_bytes = os.path.getsize(path)
@@ -183,7 +230,9 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
                 if parsed is None and tfmt == "m.d.y":
                     parsed = parse_line(raw, "d.m.y")  # 行级回退（§7 注）
                 if parsed is None:
+                    bad_lines += 1
                     continue
+                index.add(parsed)
                 records = [
                     {"timestamp": parsed.timestamp, "metric": "battery_level",
                      "value": parsed.battery_level},
@@ -202,11 +251,15 @@ class BatteryInfoViewPlugin(AnalysisBuddyPlugin):
                 if line_no % 20000 == 0:
                     ctx.progress(percent=None, bytes_read=None)
         ctx.progress(percent=100.0, bytes_read=file_bytes)
+        # P0：BivIndex 与 bad_lines 在 parse 期构建/统计（load 不再全扫描）
+        data["index"] = index
+        data["bad_lines"] = bad_lines
         return total
 
     def on_key_values(self, file_id: str, timestamp_ms: int) -> dict:
         data = self._files.get(file_id)
-        if data is None:
+        # file 尚未 parse（index 未构建）→ 无状态可查
+        if data is None or data.get("index") is None:
             return {"entries": []}
         state = data["index"].state_at(timestamp_ms)
         return {"entries": [{"key": k, "value": v} for k, v in state.items()]}

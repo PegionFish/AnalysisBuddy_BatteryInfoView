@@ -1,0 +1,27 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  pack:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack plugin zip
+        shell: powershell
+        run: |
+          & .\scripts\pack.ps1 -OutDir .\dist
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/AnalysisBuddy_batteryinfoview_v*.zip
+            dist/SHA256SUMS.txt
